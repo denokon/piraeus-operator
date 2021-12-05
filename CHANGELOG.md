@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [v1.7.0-rc.2] - 2021-11-18
+
+### Changed
+
+- recreates or updates to the satellite pods are now applied at once, instead of waiting for a node to complete before
+  moving to the next.
+
+### Fixed
+
+- Fixed a deadlock when reconciling satellites
+
+## [v1.7.0-rc.1] - 2021-11-15
+
+### Added
+
+- `pv-hostpath`: automatically determine on which nodes PVs should be created if no override is given.
+- Automatically add labels on Kubernetes Nodes to LINSTOR satellites as Auxiliary Properties. This enables using
+  Kubernetes labels for volume scheduling, for example using `replicasOnSame: topology.kubernetes.io/zone`.
+- Support LINSTORs `k8s` backend by adding the necessary RBAC resources and [documentation](./doc/k8s-backend.md).
+- Automatically create a LINSTOR passphrase when none is configured.
+- Automatic eviction and deletion of offline satellites if the Kubernetes node object was also deleted.
+
+### Changed
+
+- Enable CSI topology by default, allowing better volume scheduling with `volumeBindingMode: WaitForFirstConsumer`.
+- Disable STORK by default. Instead, we recommend using `volumeBindingMode: WaitForFirstConsumer` in storage classes.
+
 ## [v1.6.0] - 2021-09-02
 
 ### Added
@@ -465,3 +494,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [v1.5.0]: https://github.com/piraeusdatastore/piraeus-operator/compare/v1.4.0...v1.5.0
 [v1.5.1]: https://github.com/piraeusdatastore/piraeus-operator/compare/v1.5.0...v1.5.1
 [v1.6.0]: https://github.com/piraeusdatastore/piraeus-operator/compare/v1.5.1...v1.6.0
+[v1.7.0-rc.1]: https://github.com/piraeusdatastore/piraeus-operator/compare/v1.6.0...v1.7.0-rc.1
+[v1.7.0-rc.2]: https://github.com/piraeusdatastore/piraeus-operator/compare/v1.7.0-rc.1...v1.7.0-rc.2
+[Unreleased]: https://github.com/piraeusdatastore/piraeus-operator/compare/v1.7.0-rc.2...HEAD

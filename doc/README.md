@@ -6,8 +6,8 @@ The [project README](../README.md) contains documentation on the initial deploym
 process. A quick summary can be found here:
 
 ```
-# Create an initial set of persistent volumes for etcd. Replace NODE0, NODE1 etc with your (master) nodes.
-helm install linstor-etcd ./charts/pv-hostpath --set "nodes={<NODE0>,<NODE1>,<NODE2>}"
+# Create an initial set of persistent volumes for etcd. Creates a hostpath volume on every control-plane node.
+helm install piraeus-etcd-pv ./charts/pv-hostpath
 # Deploy the piraeus operator chart. Replace <image> with the piraeus DRBD loader image matching your host OS.
 helm install piraeus-op ./charts/piraeus --set operator.satelliteSet.kernelModuleInjectionImage=<image>
 ```
@@ -53,6 +53,7 @@ The following example storage class configures piraeus to:
 * use the `xfs` filesystem
 * use storage pools named `ssd`
 * allow volume expansion by resizing the Persistent Volume Claim (PVC).
+* wait for the first Pod to create the volume, placing a replica on the same node if possible.
 ```yaml
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
@@ -60,6 +61,7 @@ metadata:
   name: piraeus-ssd
 provisioner: linstor.csi.linbit.com
 allowVolumeExpansion: true
+volumeBindingMode: WaitForFirstConsumer
 parameters:
   autoPlace: "2"
   storagePool: ssd

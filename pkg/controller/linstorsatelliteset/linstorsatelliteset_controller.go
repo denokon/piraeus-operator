@@ -22,9 +22,11 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/BurntSushi/toml"
+	linstor "github.com/LINBIT/golinstor"
 	lapi "github.com/LINBIT/golinstor/client"
 	"github.com/sirupsen/logrus"
 	apps "k8s.io/api/apps/v1"
@@ -274,23 +276,6 @@ func (r *ReconcileLinstorSatelliteSet) reconcileMonitoring(ctx context.Context, 
 	return drbdReactorCM, nil
 }
 
-func (r *ReconcileLinstorSatelliteSet) getLinstorClient(ctx context.Context, satelliteSet *piraeusv1.LinstorSatelliteSet) (*lc.HighLevelClient, error) {
-	log.Debug("get linstor client")
-
-	getSecret := func(secretName string) (map[string][]byte, error) {
-		secret := corev1.Secret{}
-
-		err := r.client.Get(ctx, types.NamespacedName{Name: secretName, Namespace: satelliteSet.Namespace}, &secret)
-		if err != nil {
-			return nil, err
-		}
-
-		return secret.Data, nil
-	}
-
-	return lc.NewHighLevelLinstorClientFromConfig(satelliteSet.Spec.ControllerEndpoint, &satelliteSet.Spec.LinstorClientConfig, getSecret)
-}
-
 func (r *ReconcileLinstorSatelliteSet) reconcileResource(ctx context.Context, satelliteSet *piraeusv1.LinstorSatelliteSet) error {
 	logger := log.WithFields(logrus.Fields{
 		"Name":      satelliteSet.Name,
@@ -395,13 +380,17 @@ func (r *ReconcileLinstorSatelliteSet) reconcileAllNodesOnController(ctx context
 
 	logger.Debug("ensure LINSTOR controller is reachable")
 
-	linstorClient, err := r.getLinstorClient(ctx, satelliteSet)
+	linstorClient, err := lc.NewHighLevelLinstorClientFromConfig(
+		satelliteSet.Spec.ControllerEndpoint,
+		&satelliteSet.Spec.LinstorClientConfig,
+		lc.NamedSecret(ctx, r.client, satelliteSet.Spec.LinstorHttpsClientSecret),
+	)
 	if err != nil {
 		return []error{err}
 	}
 
-	err = r.controllerReachable(ctx, linstorClient)
-	if err != nil {
+	ok := linstorClient.ControllerReachable(ctx)
+	if !ok {
 		return []error{&reconcileutil.TemporaryError{
 			Source:       fmt.Errorf("failed to contact controller: %w", err),
 			RequeueAfter: connectionRetrySeconds * time.Second,
@@ -413,37 +402,63 @@ func (r *ReconcileLinstorSatelliteSet) reconcileAllNodesOnController(ctx context
 		return []error{err}
 	}
 
-	// Every registration routine gets its own channel to send a list of errors
-	outputs := make([]chan error, len(pods))
+	k8sNodes := &corev1.NodeList{}
+
+	err = r.client.List(ctx, k8sNodes)
+	if err != nil {
+		return []error{fmt.Errorf("failed to get kubernetes nodes: %w", err)}
+	}
+
+	wg := sync.WaitGroup{}
+	errs := make([]error, len(pods))
 
 	for i := range pods {
+		i := i
 		pod := &pods[i]
-		output := make(chan error)
-		outputs[i] = output
+
+		k8sNode := findK8sNode(k8sNodes.Items, pod.Spec.NodeName)
+
+		if k8sNode == nil {
+			logger.WithField("pod", pod.Name).Debug("Node for pod not found, assuming node deleted.")
+
+			continue
+		}
 
 		// Registration can be done in parallel, so we handle per-node work in a separate go-routine
+		wg.Add(1)
+
 		go func() {
-			defer close(output)
-			output <- r.reconcilePod(ctx, linstorClient, satelliteSet, pod)
+			defer wg.Done()
+
+			errs[i] = r.reconcilePod(ctx, linstorClient, satelliteSet, pod, k8sNode)
 		}()
 	}
 
-	logger.Debug("start collecting per-node reconciliation results")
+	wg.Wait()
 
-	registerErrors := make([]error, 0)
+	nonNilErrs := make([]error, 0, len(errs))
 
-	// Every pod has its own error channel. This preserves order of errors on multiple runs
-	for i := range pods {
-		err := <-outputs[i]
-		if err != nil {
-			registerErrors = append(registerErrors, err)
+	for i := range errs {
+		if errs[i] != nil {
+			nonNilErrs = append(nonNilErrs, errs[i])
 		}
 	}
 
-	return registerErrors
+	if len(nonNilErrs) > 0 {
+		return nonNilErrs
+	}
+
+	logger.Debug("remove registered satellites without Kubernetes node")
+
+	err = r.removeDanglingSatellites(ctx, linstorClient, k8sNodes.Items)
+	if err != nil {
+		return []error{err}
+	}
+
+	return nil
 }
 
-func (r *ReconcileLinstorSatelliteSet) reconcilePod(ctx context.Context, linstorClient *lc.HighLevelClient, satelliteSet *piraeusv1.LinstorSatelliteSet, pod *corev1.Pod) error {
+func (r *ReconcileLinstorSatelliteSet) reconcilePod(ctx context.Context, linstorClient *lc.HighLevelClient, satelliteSet *piraeusv1.LinstorSatelliteSet, pod *corev1.Pod, k8sNode *corev1.Node) error {
 	podLog := log.WithFields(logrus.Fields{
 		"podName":      pod.Name,
 		"podNameSpace": pod.Namespace,
@@ -452,7 +467,7 @@ func (r *ReconcileLinstorSatelliteSet) reconcilePod(ctx context.Context, linstor
 
 	podLog.Debug("reconcile node registration")
 
-	err := r.reconcileSingleNodeRegistration(ctx, linstorClient, satelliteSet, pod)
+	err := r.reconcileSingleNodeRegistration(ctx, linstorClient, satelliteSet, pod, k8sNode)
 	if err != nil {
 		return err
 	}
@@ -476,10 +491,11 @@ func (r *ReconcileLinstorSatelliteSet) reconcilePod(ctx context.Context, linstor
 	return nil
 }
 
-func (r *ReconcileLinstorSatelliteSet) reconcileSingleNodeRegistration(ctx context.Context, linstorClient *lc.HighLevelClient, satelliteSet *piraeusv1.LinstorSatelliteSet, pod *corev1.Pod) error {
+func (r *ReconcileLinstorSatelliteSet) reconcileSingleNodeRegistration(ctx context.Context, linstorClient *lc.HighLevelClient, satelliteSet *piraeusv1.LinstorSatelliteSet, pod *corev1.Pod, k8sNode *corev1.Node) error {
 	lNode, err := linstorClient.GetNodeOrCreate(ctx, lapi.Node{
-		Name: pod.Spec.NodeName,
-		Type: lc.Satellite,
+		Name:  pod.Spec.NodeName,
+		Type:  lc.Satellite,
+		Props: nodeLabelsToProps(k8sNode.Labels),
 		NetInterfaces: []lapi.NetInterface{
 			{
 				Name:                    "default",
@@ -491,7 +507,7 @@ func (r *ReconcileLinstorSatelliteSet) reconcileSingleNodeRegistration(ctx conte
 		},
 	})
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to reconcile satellite: %w", err)
 	}
 
 	if lNode.ConnectionStatus != lc.Online {
@@ -721,7 +737,11 @@ func (r *ReconcileLinstorSatelliteSet) reconcileLinstorStatus(ctx context.Contex
 		"Op":        "reconcileLinstorStatus",
 	})
 
-	linstorClient, err := r.getLinstorClient(ctx, satelliteSet)
+	linstorClient, err := lc.NewHighLevelLinstorClientFromConfig(
+		satelliteSet.Spec.ControllerEndpoint,
+		&satelliteSet.Spec.LinstorClientConfig,
+		lc.NamedSecret(ctx, r.client, satelliteSet.Spec.LinstorHttpsClientSecret),
+	)
 	if err != nil {
 		return err
 	}
@@ -729,8 +749,8 @@ func (r *ReconcileLinstorSatelliteSet) reconcileLinstorStatus(ctx context.Contex
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	err = r.controllerReachable(ctx, linstorClient)
-	if err != nil {
+	ok := linstorClient.ControllerReachable(ctx)
+	if !ok {
 		return fmt.Errorf("controller not reachable: %w", err)
 	}
 
@@ -845,6 +865,12 @@ func newSatelliteDaemonSet(satelliteSet *piraeusv1.LinstorSatelliteSet, satellit
 		ObjectMeta: meta,
 		Spec: apps.DaemonSetSpec{
 			Selector: &metav1.LabelSelector{MatchLabels: meta.Labels},
+			UpdateStrategy: apps.DaemonSetUpdateStrategy{
+				Type: apps.RollingUpdateDaemonSetStrategyType,
+				RollingUpdate: &apps.RollingUpdateDaemonSet{
+					MaxUnavailable: &intstr.IntOrString{Type: intstr.String, StrVal: "100%"},
+				},
+			},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: meta,
 				Spec: corev1.PodSpec{
@@ -1289,7 +1315,11 @@ func (r *ReconcileLinstorSatelliteSet) finalizeSatelliteSet(ctx context.Context,
 	errs := make([]error, 0)
 	keepNodes := make([]*shared.SatelliteStatus, 0)
 
-	linstorClient, err := r.getLinstorClient(ctx, satelliteSet)
+	linstorClient, err := lc.NewHighLevelLinstorClientFromConfig(
+		satelliteSet.Spec.ControllerEndpoint,
+		&satelliteSet.Spec.LinstorClientConfig,
+		lc.NamedSecret(ctx, r.client, satelliteSet.Spec.LinstorHttpsClientSecret),
+	)
 	if err != nil {
 		return []error{err}
 	}
@@ -1322,6 +1352,66 @@ func (r *ReconcileLinstorSatelliteSet) controllerReachable(ctx context.Context, 
 	return err
 }
 
+// removeDanglingSatellites removes satellites that were registered by the operator and are no longer present.
+func (r *ReconcileLinstorSatelliteSet) removeDanglingSatellites(ctx context.Context, linstorClient *lc.HighLevelClient, k8sNodes []corev1.Node) error {
+	lnodes, err := linstorClient.Nodes.GetAll(ctx, &lapi.ListOpts{
+		Prop: []string{fmt.Sprintf("%s=%s", kubeSpec.LinstorRegistrationProperty, kubeSpec.Name)},
+	})
+	if err != nil {
+		return fmt.Errorf("failed to list nodes")
+	}
+
+	for i := range lnodes {
+		node := &lnodes[i]
+
+		log := log.WithField("node", node.Name)
+
+		if node.Type != lc.Satellite {
+			continue
+		}
+
+		k8sNode := findK8sNode(k8sNodes, node.Name)
+
+		if k8sNode != nil {
+			log.Debug("node exists in kubernetes, no eviction")
+
+			continue
+		}
+
+		log.Debug("node does not exist in kubernetes, evicting")
+
+		if node.ConnectionStatus != lc.Offline {
+			return fmt.Errorf("online satellite registered by operator without associated k8s node")
+		}
+
+		err := linstorClient.Nodes.Evict(ctx, node.Name)
+		if err != nil {
+			return fmt.Errorf("failed to evict node '%s': %w", node.Name, err)
+		}
+
+		if mdutil.SliceContains(node.Flags, linstor.FlagEvicted) {
+			log.Debug("node evicted, deleting")
+
+			err := linstorClient.Nodes.Lost(ctx, node.Name)
+			if err != nil {
+				return fmt.Errorf("failed to delete node '%s': %w", node.Name, err)
+			}
+		}
+	}
+
+	return nil
+}
+
+func findK8sNode(nodes []corev1.Node, name string) *corev1.Node {
+	for i := range nodes {
+		if nodes[i].Name == name {
+			return &nodes[i]
+		}
+	}
+
+	return nil
+}
+
 func getObjectMeta(satelliteSet *piraeusv1.LinstorSatelliteSet, nameFmt string) metav1.ObjectMeta {
 	return metav1.ObjectMeta{
 		Name:      fmt.Sprintf(nameFmt, satelliteSet.Name),
@@ -1332,6 +1422,18 @@ func getObjectMeta(satelliteSet *piraeusv1.LinstorSatelliteSet, nameFmt string) 
 			"app.kubernetes.io/managed-by": kubeSpec.Name,
 		},
 	}
+}
+
+func nodeLabelsToProps(labels map[string]string) map[string]string {
+	result := map[string]string{
+		kubeSpec.LinstorRegistrationProperty: kubeSpec.Name,
+	}
+
+	for k, v := range labels {
+		result[fmt.Sprintf("%s/%s", linstor.NamespcAuxiliary, k)] = v
+	}
+
+	return result
 }
 
 const monitoringPort = 9942

@@ -1,8 +1,10 @@
+IHaveBackedUpAllMyLinstorResources: false
 global:
   imagePullPolicy: IfNotPresent # empty pull policy means k8s default is used ("always" if tag == ":latest", "ifnotpresent" else)
   setSecurityContext: true # Force non-privileged containers to run as non-root users
 # Dependency charts
 etcd:
+  enabled: true
   persistentVolume:
     enabled: true
     storage: 1Gi
@@ -12,7 +14,7 @@ etcd:
     repository: daocloud.io/piraeus/etcd
     tag: v3.4.15
 stork:
-  enabled: true
+  enabled: false
   storkImage: daocloud.io/piraeus/stork:2.6.5
   schedulerImage: daocloud.io/piraeus/kube-scheduler-amd64
   schedulerTag: ""
@@ -22,11 +24,11 @@ stork:
   podsecuritycontext: {}
 csi:
   enabled: true
-  pluginImage: daocloud.io/piraeus/piraeus-csi:v0.14.1
+  pluginImage: daocloud.io/piraeus/piraeus-csi:v0.16.1
   csiAttacherImage: daocloud.io/piraeus/csi-attacher:v3.3.0
-  csiLivenessProbeImage: daocloud.io/piraeus/livenessprobe:v2.4.0
-  csiNodeDriverRegistrarImage: daocloud.io/piraeus/csi-node-driver-registrar:v2.3.0
-  csiProvisionerImage: daocloud.io/piraeus/csi-provisioner:v2.2.2
+  csiLivenessProbeImage: daocloud.io/piraeus/livenessprobe:v2.5.0
+  csiNodeDriverRegistrarImage: daocloud.io/piraeus/csi-node-driver-registrar:v2.4.0
+  csiProvisionerImage: daocloud.io/piraeus/csi-provisioner:v3.0.0
   csiSnapshotterImage: daocloud.io/piraeus/csi-snapshotter:v4.2.1
   csiResizerImage: daocloud.io/piraeus/csi-resizer:v1.3.0
   controllerReplicas: 1
@@ -34,7 +36,7 @@ csi:
   nodeTolerations: []
   controllerAffinity: {}
   controllerTolerations: []
-  enableTopology: false
+  enableTopology: true
   resources: {}
   kubeletPath: /var/lib/kubelet
 priorityClassName: ""
@@ -47,14 +49,15 @@ psp:
   unprivilegedRole: ""
 operator:
   replicas: 1 # <- number of replicas for the operator deployment
-  image: daocloud.io/piraeus/piraeus-operator:v1.6.0
+  image: daocloud.io/piraeus/piraeus-operator:latest
   affinity: {}
   tolerations: []
   resources: {}
   podsecuritycontext: {}
   controller:
     enabled: true
-    controllerImage: daocloud.io/piraeus/piraeus-server:v1.14.0
+    controllerImage: daocloud.io/piraeus/piraeus-server:v1.16.0
+    dbConnectionURL: ""
     luksSecret: ""
     dbCertSecret: ""
     dbUseClientCert: false
@@ -70,15 +73,15 @@ operator:
     additionalProperties: {}
   satelliteSet:
     enabled: true
-    satelliteImage: daocloud.io/piraeus/piraeus-server:v1.14.0
+    satelliteImage: daocloud.io/piraeus/piraeus-server:v1.16.0
     storagePools: {}
     sslSecret: ""
     automaticStorageType: None
     affinity: {}
     tolerations: []
     resources: {}
-    monitoringImage: daocloud.io/piraeus/drbd-reactor:v0.4.3
-    kernelModuleInjectionImage: daocloud.io/piraeus/drbd9-bionic:v9.0.30
+    monitoringImage: daocloud.io/piraeus/drbd-reactor:v0.4.4
+    kernelModuleInjectionImage: daocloud.io/piraeus/drbd9-bionic:v9.1.4
     kernelModuleInjectionMode: Compile
     kernelModuleInjectionResources: {}
     additionalEnv: []
